@@ -273,18 +273,29 @@ These settings are hashed into the **Akamai fingerprint**. httpcloak sends the e
 ### Browser Fingerprints
 - **TLS Fingerprinting**: JA3/JA4 fingerprints match real Chrome/Firefox
 - **HTTP/2 Fingerprinting**: SETTINGS, WINDOW_UPDATE, PRIORITY frames match browsers
-- **HTTP/3 Support**: QUIC with proper fingerprinting (auto-fallback to HTTP/2)
+- **HTTP/3 Support**: QUIC with proper fingerprinting
+- **HTTP/1.1 Support**: For legacy servers with browser-like header ordering
 - **Client Hints**: Sec-Ch-Ua-* headers matching the spoofed browser
 - **Header Coherence**: Sec-Fetch-* headers are always consistent
 
+### Protocol Support
+- **Auto Protocol Selection**: Tries HTTP/3 → HTTP/2 → HTTP/1.1 with smart fallback
+- **Protocol Learning**: Remembers which protocol each host supports
+- **Force Protocol**: Can force specific protocol (H1, H2, or H3) per request
+- **Plain HTTP**: Automatically uses HTTP/1.1 for non-TLS connections
+
 ### HTTP Features
-- **Connection Pooling**: Efficient connection reuse with HTTP/2 multiplexing
+- **Connection Pooling**: Efficient connection reuse (H2 multiplexing, H1 keep-alive)
 - **Session Management**: Cookie jar for persistent sessions (like `requests.Session()`)
 - **Automatic Decompression**: gzip, brotli, zstd
-- **Redirect Following**: Configurable, with history tracking
+- **Redirect Following**: Configurable, with history tracking (`resp.RedirectHistory`)
 - **Retry with Backoff**: Exponential backoff with jitter
 - **Proxy Support**: HTTP, HTTPS, SOCKS5 proxies
 - **Authentication**: Basic, Bearer, Digest auth
+- **Better Error Handling**: Categorized errors (DNS, TLS, timeout, connection) with retry hints
+- **Request Hooks**: Pre-request and post-response callbacks
+- **Prepared Requests**: Inspect and modify requests before sending
+- **Certificate Pinning**: Pin certificates by SPKI hash for security
 
 ### Request Modes
 - **Navigate Mode**: Simulates user-initiated navigation (Sec-Fetch-Mode: navigate)
@@ -377,6 +388,13 @@ defer c.Close()
 ### Force Protocol
 
 ```go
+// Force HTTP/1.1 (for legacy servers or specific requirements)
+resp, err := c.Do(ctx, &client.Request{
+    Method:        "GET",
+    URL:           "https://example.com",
+    ForceProtocol: client.ProtocolHTTP1,
+})
+
 // Force HTTP/2 (skip HTTP/3 attempt)
 resp, err := c.Do(ctx, &client.Request{
     Method:        "GET",
@@ -390,6 +408,97 @@ resp, err := c.Do(ctx, &client.Request{
     URL:           "https://example.com",
     ForceProtocol: client.ProtocolHTTP3,
 })
+
+// Auto (default) - tries H3 → H2 → H1 with smart fallback
+resp, err := c.Do(ctx, &client.Request{
+    Method:        "GET",
+    URL:           "https://example.com",
+    ForceProtocol: client.ProtocolAuto,
+})
+```
+
+### Request Hooks
+
+```go
+c := client.NewClient("chrome-143")
+defer c.Close()
+
+// Add pre-request hook (logging, modification)
+c.OnPreRequest(func(req *http.Request) error {
+    log.Printf("Requesting: %s %s", req.Method, req.URL)
+    req.Header.Set("X-Custom-Header", "value")
+    return nil
+})
+
+// Add post-response hook (logging, metrics)
+c.OnPostResponse(func(resp *client.Response) error {
+    log.Printf("Response: %d from %s", resp.StatusCode, resp.FinalURL)
+    return nil
+})
+
+resp, _ := c.Get(ctx, "https://example.com", nil)
+```
+
+### Prepared Requests
+
+```go
+c := client.NewClient("chrome-143")
+defer c.Close()
+
+// Prepare a request without sending
+prepared, err := c.Prepare(ctx, &client.Request{
+    Method: "POST",
+    URL:    "https://api.example.com/data",
+    Body:   []byte(`{"key": "value"}`),
+})
+
+// Inspect and modify before sending
+prepared.SetHeader("X-Request-ID", "abc123")
+prepared.SetHeader("Authorization", "Bearer token")
+
+// Send when ready
+resp, err := prepared.Send(ctx)
+```
+
+### Certificate Pinning
+
+```go
+c := client.NewClient("chrome-143")
+defer c.Close()
+
+// Pin by SPKI SHA256 hash (base64 encoded)
+c.PinCertificate("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    client.ForHost("api.example.com"),
+    client.IncludeSubdomains())
+
+// Or load from certificate file
+err := c.PinCertificateFromFile("/path/to/cert.pem",
+    client.ForHost("api.example.com"))
+
+// Requests will fail if certificate doesn't match pin
+resp, err := c.Get(ctx, "https://api.example.com/data", nil)
+if err != nil {
+    // Check if it's a pinning error
+    var pinErr *client.CertPinError
+    if errors.As(err, &pinErr) {
+        log.Printf("Certificate pinning failed: %v", pinErr)
+    }
+}
+```
+
+### Redirect History
+
+```go
+c := client.NewClient("chrome-143")
+defer c.Close()
+
+resp, _ := c.Get(ctx, "https://example.com/redirect-chain", nil)
+
+// Access redirect history
+for i, redirect := range resp.RedirectHistory {
+    fmt.Printf("Redirect %d: %d -> %s\n", i+1, redirect.StatusCode, redirect.URL)
+}
+fmt.Printf("Final URL: %s\n", resp.FinalURL)
 ```
 
 ## Examples
@@ -422,14 +531,19 @@ httpcloak/
 │   ├── stream.go      # SSE/streaming support
 │   ├── url.go         # URL building utilities
 │   ├── helpers.go     # Utility functions
+│   ├── hooks.go       # Request hooks (pre/post callbacks)
+│   ├── prepared.go    # Prepared requests pattern
+│   ├── certpin.go     # Certificate pinning
 │   └── http3_client.go # HTTP/3 client implementation
 ├── fingerprint/
 │   └── presets.go     # Browser fingerprint definitions (TLS + HTTP/2)
 ├── transport/
-│   ├── transport.go   # Transport layer abstraction
-│   ├── http2_transport.go  # HTTP/2 with custom TLS
-│   ├── http3_transport.go  # HTTP/3 (QUIC)
-│   └── http2_custom.go     # Custom HTTP/2 framing
+│   ├── transport.go       # Unified transport (H1/H2/H3 with auto-fallback)
+│   ├── http1_transport.go # HTTP/1.1 with uTLS and keep-alive pooling
+│   ├── http2_transport.go # HTTP/2 with custom TLS
+│   ├── http3_transport.go # HTTP/3 (QUIC)
+│   ├── http2_custom.go    # Custom HTTP/2 framing
+│   └── errors.go          # Categorized errors (DNS, TLS, timeout, etc.)
 ├── pool/
 │   ├── pool.go        # Connection pool for HTTP/2
 │   └── quic_pool.go   # Connection pool for HTTP/3
@@ -541,6 +655,8 @@ This test:
 | Bypasses Bot Detection | ✗ | ✗ | ✓ |
 
 ## Security Considerations
+
+This lib is not specifically created to **bypass cloudflare** or other similar bot detection tools but mainly was created for implementing a transport layer identical to the ones is used by present in all modern browsers.
 
 This library is intended for:
 - Web scraping where you have permission

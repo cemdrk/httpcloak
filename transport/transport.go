@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -22,13 +21,31 @@ import (
 type Protocol int
 
 const (
-	// ProtocolAuto automatically selects HTTP/3 or HTTP/2
+	// ProtocolAuto automatically selects the best protocol (H3 -> H2 -> H1)
 	ProtocolAuto Protocol = iota
+	// ProtocolHTTP1 forces HTTP/1.1 over TCP
+	ProtocolHTTP1
 	// ProtocolHTTP2 forces HTTP/2 over TCP
 	ProtocolHTTP2
 	// ProtocolHTTP3 forces HTTP/3 over QUIC
 	ProtocolHTTP3
 )
+
+// String returns the string representation of the protocol
+func (p Protocol) String() string {
+	switch p {
+	case ProtocolAuto:
+		return "auto"
+	case ProtocolHTTP1:
+		return "h1"
+	case ProtocolHTTP2:
+		return "h2"
+	case ProtocolHTTP3:
+		return "h3"
+	default:
+		return "unknown"
+	}
+}
 
 // ProxyConfig contains proxy server configuration
 type ProxyConfig struct {
@@ -53,11 +70,12 @@ type Response struct {
 	Body       []byte
 	FinalURL   string
 	Timing     *protocol.Timing
-	Protocol   string // "h2" or "h3"
+	Protocol   string // "h1", "h2", or "h3"
 }
 
-// Transport is a unified HTTP transport supporting both HTTP/2 and HTTP/3
+// Transport is a unified HTTP transport supporting HTTP/1.1, HTTP/2, and HTTP/3
 type Transport struct {
+	h1Transport *HTTP1Transport
 	h2Transport *HTTP2Transport
 	h3Transport *HTTP3Transport
 	dnsCache    *dns.Cache
@@ -66,9 +84,12 @@ type Transport struct {
 	protocol    Protocol
 	proxy       *ProxyConfig
 
-	// Track HTTP/3 support per host
-	http3Support map[string]bool
-	http3Mu      sync.RWMutex
+	// Track protocol support per host
+	protocolSupport   map[string]Protocol // Best known protocol per host
+	protocolSupportMu sync.RWMutex
+
+	// Configuration
+	insecureSkipVerify bool
 }
 
 // NewTransport creates a new unified transport
@@ -82,15 +103,16 @@ func NewTransportWithProxy(presetName string, proxy *ProxyConfig) *Transport {
 	dnsCache := dns.NewCache()
 
 	t := &Transport{
-		dnsCache:     dnsCache,
-		preset:       preset,
-		timeout:      30 * time.Second,
-		protocol:     ProtocolAuto, // Try HTTP/3 first, fallback to HTTP/2
-		http3Support: make(map[string]bool),
-		proxy:        proxy,
+		dnsCache:        dnsCache,
+		preset:          preset,
+		timeout:         30 * time.Second,
+		protocol:        ProtocolAuto,
+		protocolSupport: make(map[string]Protocol),
+		proxy:           proxy,
 	}
 
-	// Create transports with proxy config
+	// Create all transports
+	t.h1Transport = NewHTTP1TransportWithProxy(preset, dnsCache, proxy)
 	t.h2Transport = NewHTTP2TransportWithProxy(preset, dnsCache, proxy)
 	t.h3Transport = NewHTTP3Transport(preset, dnsCache) // HTTP/3 doesn't support traditional proxies
 
@@ -102,22 +124,38 @@ func (t *Transport) SetProtocol(p Protocol) {
 	t.protocol = p
 }
 
+// SetInsecureSkipVerify sets whether to skip TLS certificate verification
+func (t *Transport) SetInsecureSkipVerify(skip bool) {
+	t.insecureSkipVerify = skip
+	t.h1Transport.SetInsecureSkipVerify(skip)
+}
+
 // SetProxy sets or updates the proxy configuration
 // Note: This recreates the underlying transports
 func (t *Transport) SetProxy(proxy *ProxyConfig) {
 	t.proxy = proxy
-	// Recreate HTTP/2 transport with new proxy config
+
+	// Close existing transports
+	t.h1Transport.Close()
 	t.h2Transport.Close()
+
+	// Recreate with new proxy config
+	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, proxy)
 	t.h2Transport = NewHTTP2TransportWithProxy(t.preset, t.dnsCache, proxy)
-	// HTTP/3 doesn't support traditional proxies, so it remains unchanged
+	// HTTP/3 doesn't support traditional proxies
 }
 
 // SetPreset changes the fingerprint preset
 func (t *Transport) SetPreset(presetName string) {
 	t.preset = fingerprint.Get(presetName)
-	// Recreate transports with new preset
+
+	// Close all transports
+	t.h1Transport.Close()
 	t.h2Transport.Close()
 	t.h3Transport.Close()
+
+	// Recreate with new preset
+	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, t.proxy)
 	t.h2Transport = NewHTTP2TransportWithProxy(t.preset, t.dnsCache, t.proxy)
 	t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 }
@@ -129,16 +167,34 @@ func (t *Transport) SetTimeout(timeout time.Duration) {
 
 // Do executes an HTTP request
 func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
-	// When proxy is configured, always use HTTP/2 (proxies don't support QUIC)
+	// Parse URL to determine scheme
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil {
+		return nil, NewRequestError("parse_url", "", "", "", err)
+	}
+
+	// For HTTP (non-TLS), only HTTP/1.1 is supported
+	if parsedURL.Scheme == "http" {
+		return t.doHTTP1(ctx, req)
+	}
+
+	// When proxy is configured, prefer HTTP/2 (proxies don't support QUIC well)
 	if t.proxy != nil && t.proxy.URL != "" {
-		return t.doHTTP2(ctx, req)
+		resp, err := t.doHTTP2(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		// Fallback to HTTP/1.1 if HTTP/2 fails through proxy
+		return t.doHTTP1(ctx, req)
 	}
 
 	switch t.protocol {
-	case ProtocolHTTP3:
-		return t.doHTTP3(ctx, req)
+	case ProtocolHTTP1:
+		return t.doHTTP1(ctx, req)
 	case ProtocolHTTP2:
 		return t.doHTTP2(ctx, req)
+	case ProtocolHTTP3:
+		return t.doHTTP3(ctx, req)
 	case ProtocolAuto:
 		return t.doAuto(ctx, req)
 	default:
@@ -146,39 +202,175 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 	}
 }
 
-// doAuto tries HTTP/3 first if supported, falls back to HTTP/2
+// doAuto tries protocols in order: H3 -> H2 -> H1, learning from failures
 func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error) {
 	host := extractHost(req.URL)
 
-	t.http3Mu.RLock()
-	supportsHTTP3, known := t.http3Support[host]
-	t.http3Mu.RUnlock()
+	// Check if we already know the best protocol for this host
+	t.protocolSupportMu.RLock()
+	knownProtocol, known := t.protocolSupport[host]
+	t.protocolSupportMu.RUnlock()
 
-	// If we know HTTP/3 is not supported, use HTTP/2
-	if known && !supportsHTTP3 {
-		return t.doHTTP2(ctx, req)
+	if known {
+		switch knownProtocol {
+		case ProtocolHTTP3:
+			return t.doHTTP3(ctx, req)
+		case ProtocolHTTP2:
+			resp, err := t.doHTTP2(ctx, req)
+			if err == nil {
+				return resp, nil
+			}
+			// H2 failed, try H1
+			return t.doHTTP1(ctx, req)
+		case ProtocolHTTP1:
+			return t.doHTTP1(ctx, req)
+		}
 	}
 
-	// If preset doesn't support HTTP/3, use HTTP/2
-	if !t.preset.SupportHTTP3 {
-		return t.doHTTP2(ctx, req)
+	// If preset supports HTTP/3, try it first
+	if t.preset.SupportHTTP3 {
+		resp, err := t.doHTTP3(ctx, req)
+		if err == nil {
+			t.protocolSupportMu.Lock()
+			t.protocolSupport[host] = ProtocolHTTP3
+			t.protocolSupportMu.Unlock()
+			return resp, nil
+		}
 	}
 
-	// Try HTTP/3 first
-	resp, err := t.doHTTP3(ctx, req)
+	// Try HTTP/2
+	resp, err := t.doHTTP2(ctx, req)
 	if err == nil {
-		t.http3Mu.Lock()
-		t.http3Support[host] = true
-		t.http3Mu.Unlock()
+		t.protocolSupportMu.Lock()
+		t.protocolSupport[host] = ProtocolHTTP2
+		t.protocolSupportMu.Unlock()
 		return resp, nil
 	}
 
-	// HTTP/3 failed, mark as not supported and fallback to HTTP/2
-	t.http3Mu.Lock()
-	t.http3Support[host] = false
-	t.http3Mu.Unlock()
+	// Check if it's a protocol negotiation failure (server doesn't support H2)
+	if isProtocolError(err) {
+		t.protocolSupportMu.Lock()
+		t.protocolSupport[host] = ProtocolHTTP1
+		t.protocolSupportMu.Unlock()
+	}
 
-	return t.doHTTP2(ctx, req)
+	// Fallback to HTTP/1.1
+	resp, err = t.doHTTP1(ctx, req)
+	if err == nil {
+		t.protocolSupportMu.Lock()
+		t.protocolSupport[host] = ProtocolHTTP1
+		t.protocolSupportMu.Unlock()
+		return resp, nil
+	}
+
+	return nil, err
+}
+
+// isProtocolError checks if the error indicates protocol negotiation failure
+func isProtocolError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "protocol") ||
+		strings.Contains(errStr, "alpn") ||
+		strings.Contains(errStr, "http2") ||
+		strings.Contains(errStr, "does not support")
+}
+
+// doHTTP1 executes the request over HTTP/1.1
+func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error) {
+	startTime := time.Now()
+	timing := &protocol.Timing{}
+
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil {
+		return nil, NewRequestError("parse_url", "", "", "h1", err)
+	}
+
+	host := parsedURL.Hostname()
+	port := parsedURL.Port()
+	if port == "" {
+		if parsedURL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	// Set timeout
+	timeout := t.timeout
+	if req.Timeout > 0 {
+		timeout = req.Timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Build HTTP request
+	method := req.Method
+	if method == "" {
+		method = "GET"
+	}
+
+	var bodyReader io.Reader
+	if len(req.Body) > 0 {
+		bodyReader = bytes.NewReader(req.Body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
+	if err != nil {
+		return nil, NewRequestError("create_request", host, port, "h1", err)
+	}
+
+	// Set preset headers
+	for key, value := range t.preset.Headers {
+		httpReq.Header.Set(key, value)
+	}
+	httpReq.Header.Set("User-Agent", t.preset.UserAgent)
+
+	// Override with custom headers
+	for key, value := range req.Headers {
+		httpReq.Header.Set(key, value)
+	}
+
+	// Record timing before request
+	reqStart := time.Now()
+
+	// Make request
+	resp, err := t.h1Transport.RoundTrip(httpReq)
+	if err != nil {
+		return nil, WrapError("roundtrip", host, port, "h1", err)
+	}
+	defer resp.Body.Close()
+
+	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, NewRequestError("read_body", host, port, "h1", err)
+	}
+
+	// Decompress if needed
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	body, err = decompress(body, contentEncoding)
+	if err != nil {
+		return nil, NewRequestError("decompress", host, port, "h1", err)
+	}
+
+	timing.Total = float64(time.Since(startTime).Milliseconds())
+
+	// Build response headers map
+	headers := buildHeadersMap(resp.Header)
+
+	return &Response{
+		StatusCode: resp.StatusCode,
+		Headers:    headers,
+		Body:       body,
+		FinalURL:   req.URL,
+		Timing:     timing,
+		Protocol:   "h1",
+	}, nil
 }
 
 // doHTTP2 executes the request over HTTP/2
@@ -186,14 +378,14 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	startTime := time.Now()
 	timing := &protocol.Timing{}
 
-	// Parse URL
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %w", err)
+		return nil, NewRequestError("parse_url", "", "", "h2", err)
 	}
 
 	if parsedURL.Scheme != "https" {
-		return nil, fmt.Errorf("only HTTPS is supported")
+		return nil, NewProtocolError("", "", "h2",
+			&TransportError{Op: "scheme_check", Cause: ErrProtocol, Category: ErrProtocol})
 	}
 
 	host := parsedURL.Hostname()
@@ -202,7 +394,7 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 		port = "443"
 	}
 
-	// Get connection use count BEFORE the request to detect if new connection was created
+	// Get connection use count BEFORE the request
 	useCountBefore := t.h2Transport.GetConnectionUseCount(host, port)
 
 	// Set timeout
@@ -226,7 +418,7 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, NewRequestError("create_request", host, port, "h2", err)
 	}
 
 	// Set preset headers
@@ -243,10 +435,10 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	// Record timing before request
 	reqStart := time.Now()
 
-	// Make request via transport (handles connection reuse)
+	// Make request
 	resp, err := t.h2Transport.RoundTrip(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, WrapError("roundtrip", host, port, "h2", err)
 	}
 	defer resp.Body.Close()
 
@@ -255,51 +447,35 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, NewRequestError("read_body", host, port, "h2", err)
 	}
 
 	// Decompress if needed
 	contentEncoding := resp.Header.Get("Content-Encoding")
 	body, err = decompress(body, contentEncoding)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decompress response: %w", err)
+		return nil, NewRequestError("decompress", host, port, "h2", err)
 	}
 
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
-	// Check if connection was reused by comparing use counts
-	// If useCountBefore was 0, a new connection was created
-	// If useCountBefore >= 1, the existing connection was reused
+	// Calculate timing breakdown
 	wasReused := useCountBefore >= 1
-
-	// Set timing based on actual connection reuse
 	if wasReused {
-		// Reused connection - no connection overhead
 		timing.DNSLookup = 0
 		timing.TCPConnect = 0
 		timing.TLSHandshake = 0
 	} else {
-		// New connection - the firstByte time includes DNS/TCP/TLS overhead
-		// Estimate breakdown based on typical ratios
-		connectionOverhead := timing.FirstByte * 0.7 // ~70% of first byte is connection setup
-		if connectionOverhead > 10 {                 // Only show if significant (>10ms)
-			timing.DNSLookup = connectionOverhead * 0.2    // ~20% DNS
-			timing.TCPConnect = connectionOverhead * 0.3   // ~30% TCP
-			timing.TLSHandshake = connectionOverhead * 0.5 // ~50% TLS
+		connectionOverhead := timing.FirstByte * 0.7
+		if connectionOverhead > 10 {
+			timing.DNSLookup = connectionOverhead * 0.2
+			timing.TCPConnect = connectionOverhead * 0.3
+			timing.TLSHandshake = connectionOverhead * 0.5
 		}
 	}
 
 	// Build response headers map
-	headers := make(map[string]string)
-	for key, values := range resp.Header {
-		lowerKey := strings.ToLower(key)
-		// Set-Cookie headers need special handling - join with newline to preserve each cookie
-		if lowerKey == "set-cookie" {
-			headers[lowerKey] = strings.Join(values, "\n")
-		} else {
-			headers[lowerKey] = strings.Join(values, ", ")
-		}
-	}
+	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
 		StatusCode: resp.StatusCode,
@@ -316,17 +492,23 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	startTime := time.Now()
 	timing := &protocol.Timing{}
 
-	// Parse URL
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %w", err)
+		return nil, NewRequestError("parse_url", "", "", "h3", err)
 	}
 
 	if parsedURL.Scheme != "https" {
-		return nil, fmt.Errorf("only HTTPS is supported")
+		return nil, NewProtocolError("", "", "h3",
+			&TransportError{Op: "scheme_check", Cause: ErrProtocol, Category: ErrProtocol})
 	}
 
-	// Get dial count BEFORE the request to detect if new connection was created
+	host := parsedURL.Hostname()
+	port := parsedURL.Port()
+	if port == "" {
+		port = "443"
+	}
+
+	// Get dial count BEFORE the request
 	dialCountBefore := t.h3Transport.GetDialCount()
 
 	// Set timeout
@@ -350,7 +532,7 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, NewRequestError("create_request", host, port, "h3", err)
 	}
 
 	// Set preset headers
@@ -367,10 +549,10 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	// Record timing before request
 	reqStart := time.Now()
 
-	// Make request via transport (custom dialer handles connection reuse)
+	// Make request
 	resp, err := t.h3Transport.RoundTrip(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP/3 request failed: %w", err)
+		return nil, WrapError("roundtrip", host, port, "h3", err)
 	}
 	defer resp.Body.Close()
 
@@ -379,50 +561,36 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, NewRequestError("read_body", host, port, "h3", err)
 	}
 
 	// Decompress if needed
 	contentEncoding := resp.Header.Get("Content-Encoding")
 	body, err = decompress(body, contentEncoding)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decompress response: %w", err)
+		return nil, NewRequestError("decompress", host, port, "h3", err)
 	}
 
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
-	// Check if connection was reused by comparing dial counts
-	// If dialCount increased, a new connection was created
+	// Calculate timing breakdown (HTTP/3 uses QUIC, no TCP)
 	dialCountAfter := t.h3Transport.GetDialCount()
 	wasReused := dialCountAfter == dialCountBefore
-
-	// HTTP/3 uses QUIC over UDP - no TCP connect
 	timing.TCPConnect = 0
 
 	if wasReused {
-		// Reused QUIC connection - no DNS or handshake overhead
 		timing.DNSLookup = 0
 		timing.TLSHandshake = 0
 	} else {
-		// New QUIC connection - the firstByte time includes DNS and QUIC handshake
-		connectionOverhead := timing.FirstByte * 0.7 // ~70% of first byte is connection setup
-		if connectionOverhead > 10 {                 // Only show if significant (>10ms)
-			timing.DNSLookup = connectionOverhead * 0.3    // ~30% DNS
-			timing.TLSHandshake = connectionOverhead * 0.7 // ~70% QUIC/TLS (combined in QUIC)
+		connectionOverhead := timing.FirstByte * 0.7
+		if connectionOverhead > 10 {
+			timing.DNSLookup = connectionOverhead * 0.3
+			timing.TLSHandshake = connectionOverhead * 0.7
 		}
 	}
 
 	// Build response headers map
-	headers := make(map[string]string)
-	for key, values := range resp.Header {
-		lowerKey := strings.ToLower(key)
-		// Set-Cookie headers need special handling - join with newline to preserve each cookie
-		if lowerKey == "set-cookie" {
-			headers[lowerKey] = strings.Join(values, "\n")
-		} else {
-			headers[lowerKey] = strings.Join(values, ", ")
-		}
-	}
+	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
 		StatusCode: resp.StatusCode,
@@ -436,6 +604,7 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 
 // Close shuts down the transport
 func (t *Transport) Close() {
+	t.h1Transport.Close()
 	t.h2Transport.Close()
 	t.h3Transport.Close()
 }
@@ -443,6 +612,7 @@ func (t *Transport) Close() {
 // Stats returns transport statistics
 func (t *Transport) Stats() map[string]interface{} {
 	return map[string]interface{}{
+		"http1": t.h1Transport.Stats(),
 		"http2": t.h2Transport.Stats(),
 		"http3": t.h3Transport.Stats(),
 	}
@@ -453,6 +623,13 @@ func (t *Transport) GetDNSCache() *dns.Cache {
 	return t.dnsCache
 }
 
+// ClearProtocolCache clears the learned protocol support cache
+func (t *Transport) ClearProtocolCache() {
+	t.protocolSupportMu.Lock()
+	t.protocolSupport = make(map[string]Protocol)
+	t.protocolSupportMu.Unlock()
+}
+
 // Helper functions
 
 func extractHost(urlStr string) string {
@@ -461,6 +638,19 @@ func extractHost(urlStr string) string {
 		return ""
 	}
 	return parsed.Hostname()
+}
+
+func buildHeadersMap(h http.Header) map[string]string {
+	headers := make(map[string]string)
+	for key, values := range h {
+		lowerKey := strings.ToLower(key)
+		if lowerKey == "set-cookie" {
+			headers[lowerKey] = strings.Join(values, "\n")
+		} else {
+			headers[lowerKey] = strings.Join(values, ", ")
+		}
+	}
+	return headers
 }
 
 func decompress(data []byte, encoding string) ([]byte, error) {

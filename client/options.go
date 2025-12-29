@@ -194,14 +194,39 @@ func WithDisableHTTP3() Option {
 	}
 }
 
-// Protocol enum
+// Protocol enum for forcing specific HTTP protocol versions
 type Protocol int
 
 const (
-	ProtocolAuto  Protocol = iota // Auto-detect (H3 first, fallback to H2)
+	ProtocolAuto  Protocol = iota // Auto-detect (H3 -> H2 -> H1 fallback)
+	ProtocolHTTP1                 // Force HTTP/1.1
 	ProtocolHTTP2                 // Force HTTP/2
 	ProtocolHTTP3                 // Force HTTP/3
 )
+
+// String returns the string representation of the protocol
+func (p Protocol) String() string {
+	switch p {
+	case ProtocolAuto:
+		return "auto"
+	case ProtocolHTTP1:
+		return "h1"
+	case ProtocolHTTP2:
+		return "h2"
+	case ProtocolHTTP3:
+		return "h3"
+	default:
+		return "unknown"
+	}
+}
+
+// WithForceHTTP1 forces HTTP/1.1 for all requests
+func WithForceHTTP1() Option {
+	return func(c *ClientConfig) {
+		c.DisableH3 = true
+		// Note: Client will check for ForceHTTP1 flag
+	}
+}
 
 // EnableCookies is a marker to enable cookie jar in NewClient
 // Use NewSession() instead for simpler API, or call client.EnableCookies() after creation

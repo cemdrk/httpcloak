@@ -32,6 +32,9 @@ type StreamResponse struct {
 	reader       io.ReadCloser
 	decompressor io.Closer
 	rawReader    io.ReadCloser
+
+	// Context cancel function - must be called when response is closed
+	cancel context.CancelFunc
 }
 
 // Read reads data from the response body
@@ -39,8 +42,11 @@ func (r *StreamResponse) Read(p []byte) (n int, err error) {
 	return r.reader.Read(p)
 }
 
-// Close closes the response body
+// Close closes the response body and cancels the context
 func (r *StreamResponse) Close() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
 	if r.decompressor != nil {
 		r.decompressor.Close()
 	}
@@ -110,7 +116,7 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 		timeout = req.Timeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	// Note: don't defer cancel() - caller needs to close response
+	// cancel is passed to StreamResponse and called when Close() is invoked
 
 	// Check if HTTP/3 has failed for this host recently
 	hostKey := host + ":" + port
@@ -169,7 +175,14 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 			cancel()
 			return nil, err
 		}
+	case ProtocolHTTP1:
+		resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("HTTP/1.1 failed: %w", err)
+		}
 	default:
+		// Auto mode: try H3 -> H2 -> H1 with fallback
 		if useH3 {
 			resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
 			if err != nil {
@@ -178,17 +191,23 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 					httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
 				}
 				resp, usedProtocol, err = c.doHTTP2(ctx, host, port, httpReq, timing, startTime)
-				if err != nil {
-					cancel()
-					return nil, err
-				}
 			}
 		} else {
 			resp, usedProtocol, err = c.doHTTP2(ctx, host, port, httpReq, timing, startTime)
-			if err != nil {
-				cancel()
-				return nil, err
+		}
+
+		// If H2 failed and we should try H1, attempt fallback
+		if err != nil && c.shouldUseH1(hostKey) {
+			c.markH2Failed(hostKey)
+			if len(req.Body) > 0 {
+				httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
 			}
+			resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
+		}
+
+		if err != nil {
+			cancel()
+			return nil, err
 		}
 	}
 
@@ -213,6 +232,7 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 		reader:       reader,
 		decompressor: decompressor,
 		rawReader:    resp.Body,
+		cancel:       cancel,
 	}, nil
 }
 

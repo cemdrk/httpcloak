@@ -60,6 +60,7 @@ import (
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/pool"
 	"github.com/sardanioss/httpcloak/protocol"
+	"github.com/sardanioss/httpcloak/transport"
 )
 
 func init() {
@@ -70,10 +71,11 @@ func init() {
 }
 
 // Client is an HTTP client with connection pooling and fingerprint spoofing
-// By default, it tries HTTP/3 first and falls back to HTTP/2 if HTTP/3 fails
+// By default, it tries HTTP/3 first, then HTTP/2, then HTTP/1.1 as fallback
 type Client struct {
 	poolManager *pool.Manager
 	quicManager *pool.QUICManager
+	h1Transport *transport.HTTP1Transport
 	preset      *fingerprint.Preset
 	config      *ClientConfig
 
@@ -83,13 +85,23 @@ type Client struct {
 	// Cookie jar for session persistence (nil = no cookie handling)
 	cookies *CookieJar
 
+	// Request hooks for pre/post processing
+	hooks *Hooks
+
+	// Certificate pinning
+	certPinner *CertPinner
+
 	// Track which hosts don't support HTTP/3 to avoid repeated failures
 	h3Failures   map[string]time.Time
 	h3FailuresMu sync.RWMutex
+
+	// Track which hosts need HTTP/1.1 (don't support HTTP/2)
+	h2Failures   map[string]time.Time
+	h2FailuresMu sync.RWMutex
 }
 
 // NewClient creates a new HTTP client with default configuration
-// Tries HTTP/3 first, falls back to HTTP/2 if HTTP/3 fails
+// Tries HTTP/3 first, then HTTP/2, then HTTP/1.1 as fallback
 func NewClient(presetName string, opts ...Option) *Client {
 	config := DefaultConfig()
 	config.Preset = presetName
@@ -111,12 +123,22 @@ func NewClient(presetName string, opts ...Option) *Client {
 		quicManager = pool.NewQUICManager(preset, h2Manager.GetDNSCache())
 	}
 
+	// Create HTTP/1.1 transport for fallback or when explicitly requested
+	var proxyConfig *transport.ProxyConfig
+	if config.Proxy != "" {
+		proxyConfig = &transport.ProxyConfig{URL: config.Proxy}
+	}
+	h1Transport := transport.NewHTTP1TransportWithProxy(preset, h2Manager.GetDNSCache(), proxyConfig)
+	h1Transport.SetInsecureSkipVerify(config.InsecureSkipVerify)
+
 	return &Client{
 		poolManager: h2Manager,
 		quicManager: quicManager,
+		h1Transport: h1Transport,
 		preset:      preset,
 		config:      config,
 		h3Failures:  make(map[string]time.Time),
+		h2Failures:  make(map[string]time.Time),
 	}
 }
 
@@ -175,6 +197,63 @@ func (c *Client) Cookies() *CookieJar {
 func (c *Client) ClearCookies() {
 	if c.cookies != nil {
 		c.cookies.Clear()
+	}
+}
+
+// Hooks returns the client's hooks instance, creating one if needed
+func (c *Client) Hooks() *Hooks {
+	if c.hooks == nil {
+		c.hooks = NewHooks()
+	}
+	return c.hooks
+}
+
+// OnPreRequest adds a pre-request hook
+// Hook is called before each request is sent
+func (c *Client) OnPreRequest(hook PreRequestHook) *Client {
+	c.Hooks().OnPreRequest(hook)
+	return c
+}
+
+// OnPostResponse adds a post-response hook
+// Hook is called after each response is received
+func (c *Client) OnPostResponse(hook PostResponseHook) *Client {
+	c.Hooks().OnPostResponse(hook)
+	return c
+}
+
+// ClearHooks removes all hooks
+func (c *Client) ClearHooks() {
+	if c.hooks != nil {
+		c.hooks.Clear()
+	}
+}
+
+// CertPinner returns the certificate pinner, creating one if needed
+func (c *Client) CertPinner() *CertPinner {
+	if c.certPinner == nil {
+		c.certPinner = NewCertPinner()
+	}
+	return c.certPinner
+}
+
+// PinCertificate adds a certificate pin
+// hash should be base64-encoded SHA256 of the certificate's SPKI
+// Example: c.PinCertificate("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", ForHost("example.com"))
+func (c *Client) PinCertificate(hash string, opts ...PinOption) *Client {
+	c.CertPinner().AddPin(hash, opts...)
+	return c
+}
+
+// PinCertificateFromFile loads a certificate from file and pins its public key
+func (c *Client) PinCertificateFromFile(certPath string, opts ...PinOption) error {
+	return c.CertPinner().AddPinFromCertFile(certPath, opts...)
+}
+
+// ClearPins removes all certificate pins
+func (c *Client) ClearPins() {
+	if c.certPinner != nil {
+		c.certPinner.Clear()
 	}
 }
 
@@ -435,12 +514,25 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 	// Browsers have slight variations in quality values and timing
 	applyOrganicJitter(httpReq)
 
+	// Run pre-request hooks
+	if c.hooks != nil {
+		if err := c.hooks.RunPreRequest(httpReq); err != nil {
+			return nil, fmt.Errorf("pre-request hook failed: %w", err)
+		}
+	}
+
 	var resp *http.Response
 	var usedProtocol string
 	timing := &protocol.Timing{}
 
 	// Determine protocol based on ForceProtocol option
 	switch req.ForceProtocol {
+	case ProtocolHTTP1:
+		// Force HTTP/1.1 only
+		resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
+		if err != nil {
+			return nil, err
+		}
 	case ProtocolHTTP3:
 		// Force HTTP/3 only
 		resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
@@ -454,8 +546,17 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 			return nil, err
 		}
 	default:
-		// Auto: Try HTTP/3 first if not known to fail
-		if useH3 {
+		// Auto: Try HTTP/3 -> HTTP/2 -> HTTP/1.1 with smart fallback
+		useH1 := c.shouldUseH1(hostKey)
+
+		if useH1 {
+			// Known to need HTTP/1.1
+			resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
+			if err != nil {
+				return nil, err
+			}
+		} else if useH3 {
+			// Try HTTP/3 first
 			resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
 			if err != nil {
 				// HTTP/3 failed, mark it and fall back to HTTP/2
@@ -468,15 +569,43 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 
 				resp, usedProtocol, err = c.doHTTP2(ctx, host, port, httpReq, timing, startTime)
 				if err != nil {
-					return nil, err
+					// HTTP/2 also failed, try HTTP/1.1
+					c.markH2Failed(hostKey)
+
+					if len(req.Body) > 0 {
+						httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
+					}
+
+					resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
+					if err != nil {
+						return nil, err
+					}
 				}
 			}
 		} else {
-			// Use HTTP/2 directly
+			// Try HTTP/2 first
 			resp, usedProtocol, err = c.doHTTP2(ctx, host, port, httpReq, timing, startTime)
 			if err != nil {
-				return nil, err
+				// HTTP/2 failed, try HTTP/1.1
+				c.markH2Failed(hostKey)
+
+				if len(req.Body) > 0 {
+					httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
+				}
+
+				resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
+				if err != nil {
+					return nil, err
+				}
 			}
+		}
+	}
+
+	// Verify certificate pinning
+	if c.certPinner != nil && c.certPinner.HasPins() && resp.TLS != nil {
+		if err := c.certPinner.Verify(host, resp.TLS.PeerCertificates); err != nil {
+			resp.Body.Close()
+			return nil, err
 		}
 	}
 
@@ -604,7 +733,7 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
-	return &Response{
+	response := &Response{
 		StatusCode:      resp.StatusCode,
 		Headers:         headers,
 		Body:            body,
@@ -613,7 +742,17 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 		Protocol:        usedProtocol,
 		Request:         req,
 		RedirectHistory: redirectHistory,
-	}, nil
+	}
+
+	// Run post-response hooks
+	if c.hooks != nil {
+		if err := c.hooks.RunPostResponse(response); err != nil {
+			// Log but don't fail - response is still valid
+			// Hooks are for observability, not control flow
+		}
+	}
+
+	return response, nil
 }
 
 // isRedirect checks if status code is a redirect
@@ -696,6 +835,47 @@ func (c *Client) doHTTP2(ctx context.Context, host, port string, httpReq *http.R
 	return resp, "h2", nil
 }
 
+// doHTTP1 performs HTTP/1.1 request using the h1Transport
+func (c *Client) doHTTP1(ctx context.Context, host, port string, httpReq *http.Request, timing *protocol.Timing, startTime time.Time) (*http.Response, string, error) {
+	firstByteTime := time.Now()
+
+	resp, err := c.h1Transport.RoundTrip(httpReq)
+	if err != nil {
+		return nil, "", fmt.Errorf("HTTP/1.1 request failed: %w", err)
+	}
+
+	timing.FirstByte = float64(time.Since(firstByteTime).Milliseconds())
+	return resp, "h1", nil
+}
+
+// markH2Failed marks a host as not supporting HTTP/2
+func (c *Client) markH2Failed(hostKey string) {
+	c.h2FailuresMu.Lock()
+	c.h2Failures[hostKey] = time.Now()
+	c.h2FailuresMu.Unlock()
+}
+
+// shouldUseH1 checks if HTTP/1.1 should be used for this host (H2 known to fail)
+func (c *Client) shouldUseH1(hostKey string) bool {
+	c.h2FailuresMu.RLock()
+	failTime, failed := c.h2Failures[hostKey]
+	c.h2FailuresMu.RUnlock()
+
+	if !failed {
+		return false
+	}
+
+	// Cache H2 failure for 5 minutes
+	if time.Since(failTime) > 5*time.Minute {
+		c.h2FailuresMu.Lock()
+		delete(c.h2Failures, hostKey)
+		c.h2FailuresMu.Unlock()
+		return false
+	}
+
+	return true
+}
+
 // Get performs a GET request
 func (c *Client) Get(ctx context.Context, url string, headers map[string]string) (*Response, error) {
 	return c.Do(ctx, &Request{
@@ -720,6 +900,9 @@ func (c *Client) Close() {
 	c.poolManager.Close()
 	if c.quicManager != nil {
 		c.quicManager.Close()
+	}
+	if c.h1Transport != nil {
+		c.h1Transport.Close()
 	}
 }
 
